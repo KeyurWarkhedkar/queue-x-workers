@@ -5,7 +5,7 @@ on:
     branches: [ main ]
 
 env:
-  AWS_REGION: ap-south-1
+  AWS_REGION: ap-southeast-2
   ECR_REPOSITORY: queue-x-workers
   CONTAINER_NAME: queue-x-workers
 
