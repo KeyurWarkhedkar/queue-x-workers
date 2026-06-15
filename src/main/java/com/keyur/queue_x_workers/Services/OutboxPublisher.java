@@ -20,7 +20,7 @@ import java.util.List;
 public class OutboxPublisher {
 
     private final OutboxEventRepository outboxEventRepository;
-    private final RedisMessageQueue redisMessageQueue;
+    private final MessageQueue messageQueue;
 
     private String getQueueForEvent(EventType eventType) {
         return switch(eventType) {
@@ -47,7 +47,7 @@ public class OutboxPublisher {
             try {
 
                 // 1. Publish to Redis queue
-                redisMessageQueue.publish(
+                messageQueue.publish(
                         getQueueForEvent(event.getEventType()),
                         buildEventDto(event)
                 );
