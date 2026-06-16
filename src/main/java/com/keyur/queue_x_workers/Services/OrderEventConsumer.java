@@ -33,6 +33,7 @@ public class OrderEventConsumer {
     @Transactional
     public void inventoryWorker() {
         EventDto event = messageQueue.consume(QueueConstants.orderQueue);
+        log.info("Polled SQS order_queue, got: {}", event == null ? "null" : event.getOrderId());
         if(event == null) return;
         processEvent(event);
     }

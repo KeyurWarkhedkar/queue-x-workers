@@ -50,9 +50,12 @@ public class SqsMessageQueue implements MessageQueue {
                             .build()
             ).messages();
 
+            log.info("SQS poll result size: {}", messages.size());
+
             if (messages.isEmpty()) return null;
 
             Message message = messages.get(0);
+            log.info("Raw SQS message: {}", message.body());
 
             // Delete from SQS immediately after receiving
             sqsClient.deleteMessage(DeleteMessageRequest.builder()
