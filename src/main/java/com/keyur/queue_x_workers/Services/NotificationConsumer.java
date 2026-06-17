@@ -5,10 +5,13 @@ import com.keyur.queue_x_workers.Entities.NotificationIdempotencyRecord;
 import com.keyur.queue_x_workers.Enums.IdempotencyStatus;
 import com.keyur.queue_x_workers.Repositories.NotificationIdempotencyRecordRepository;
 import lombok.AllArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 
+@Slf4j
 @Service
 @AllArgsConstructor
 public class NotificationConsumer {
@@ -26,17 +29,29 @@ public class NotificationConsumer {
     }
 
     public void processNotification(EventDto eventDto) {
-        // Blind insert to maintain idempotency
-        idempotencyService.saveNotificationIdempotencyRecord(eventDto.getEventId(), eventDto.getOrderId(), IdempotencyStatus.INIT);
+        // Fresh MDC per event on this scheduler thread — cleared in finally so it
+        // never leaks into the next unrelated order processed on the same thread.
+        try {
+            MDC.put("orderId", String.valueOf(eventDto.getOrderId()));
+            log.info("sagaStep=NOTIFICATION_CONSUMED eventId={} orderId={}", eventDto.getEventId(), eventDto.getOrderId());
 
-        int affected = notificationIdempotencyRecordRepository.atomicStatusChange(IdempotencyStatus.PROCESSING, IdempotencyStatus.INIT, eventDto.getEventId());
+            // Blind insert to maintain idempotency
+            idempotencyService.saveNotificationIdempotencyRecord(eventDto.getEventId(), eventDto.getOrderId(), IdempotencyStatus.INIT);
 
-        if(affected == 0) {
-            return;
+            int affected = notificationIdempotencyRecordRepository.atomicStatusChange(IdempotencyStatus.PROCESSING, IdempotencyStatus.INIT, eventDto.getEventId());
+
+            if(affected == 0) {
+                log.info("sagaStep=NOTIFICATION_SKIPPED reason=ALREADY_PROCESSING_OR_DONE eventId={} orderId={}", eventDto.getEventId(), eventDto.getOrderId());
+                return;
+            }
+
+            emailService.sendEmail(eventDto);
+
+            notificationIdempotencyRecordRepository.atomicStatusChange(IdempotencyStatus.SUCCESS, IdempotencyStatus.PROCESSING, eventDto.getEventId());
+
+            log.info("sagaStep=NOTIFICATION_SENT orderId={}", eventDto.getOrderId());
+        } finally {
+            MDC.clear();
         }
-
-        emailService.sendEmail(eventDto);
-
-        notificationIdempotencyRecordRepository.atomicStatusChange(IdempotencyStatus.SUCCESS, IdempotencyStatus.PROCESSING, eventDto.getEventId());
     }
 }

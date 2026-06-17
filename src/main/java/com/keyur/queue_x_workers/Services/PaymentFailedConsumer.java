@@ -7,6 +7,8 @@ import com.keyur.queue_x_workers.Enums.OutboxStatus;
 import com.keyur.queue_x_workers.Repositories.OutboxEventRepository;
 import com.keyur.queue_x_workers.Repositories.ProductRepository;
 import lombok.AllArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -14,6 +16,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 import java.util.UUID;
 
+@Slf4j
 @Service
 @AllArgsConstructor
 public class PaymentFailedConsumer {
@@ -32,16 +35,28 @@ public class PaymentFailedConsumer {
     }
 
     public void processPaymentFailure(EventDto event) {
-        // Blind insert to maintain idempotency of the inventory undo operation
-        if(!idempotencyService.saveRecord(event.getEventId(), event.getOrderId())) {
-            return;
+        // Fresh MDC per event on this scheduler thread — cleared in finally so it
+        // never leaks into the next unrelated order processed on the same thread.
+        try {
+            MDC.put("orderId", String.valueOf(event.getOrderId()));
+            log.info("sagaStep=PAYMENT_FAILED_CONSUMED eventId={} orderId={}", event.getEventId(), event.getOrderId());
+
+            // Blind insert to maintain idempotency of the inventory undo operation
+            if(!idempotencyService.saveRecord(event.getEventId(), event.getOrderId())) {
+                log.info("sagaStep=COMPENSATION_SKIPPED reason=ALREADY_PROCESSED eventId={} orderId={}", event.getEventId(), event.getOrderId());
+                return;
+            }
+
+            // Increment the stock
+            productRepository.atomicIncrement(event.getProductId(), event.getQuantity());
+            log.info("sagaStep=COMPENSATING_TRANSACTION action=STOCK_RESTORED orderId={} productId={} quantity={}",
+                    event.getOrderId(), event.getProductId(), event.getQuantity());
+
+            // Write to outbox to for the Order Api to consume and mark order as Failed
+            writeToOutbox(event, 0);
+        } finally {
+            MDC.clear();
         }
-
-        // Increment the stock
-        productRepository.atomicIncrement(event.getProductId(), event.getQuantity());
-
-        // Write to outbox to for the Order Api to consume and mark order as Failed
-        writeToOutbox(event, 0);
     }
 
     private void writeToOutbox(EventDto event, double amount) {
@@ -57,5 +72,7 @@ public class PaymentFailedConsumer {
         outboxEvent.setRetryCount(0);
         outboxEvent.setCreatedAt(LocalDateTime.now());
         outboxEventRepository.save(outboxEvent);
+
+        log.info("sagaStep=OUTBOX_WRITE eventType=PAYMENT_FAILED_FOR_ORDER_API orderId={} outboxStatus=PENDING", event.getOrderId());
     }
 }

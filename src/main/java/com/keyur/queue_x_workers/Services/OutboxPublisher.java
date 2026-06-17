@@ -8,6 +8,7 @@ import com.keyur.queue_x_workers.Repositories.OutboxEventRepository;
 import com.keyur.queue_x_workers.DTOs.EventDto;
 import lombok.AllArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -44,7 +45,11 @@ public class OutboxPublisher {
                 outboxEventRepository.findPendingEvents();
 
         for (OutboxEvent event : events) {
+            // Fresh MDC per event on this scheduler thread — OutboxPublisher runs independently
+            // of whichever thread wrote the row, so orderId is re-supplied from the row itself,
+            // every iteration, then cleared before the next event in this batch.
             try {
+                MDC.put("orderId", String.valueOf(event.getOrderId()));
 
                 // 1. Publish to Redis queue
                 messageQueue.publish(
@@ -56,13 +61,15 @@ public class OutboxPublisher {
                 event.setStatus(OutboxStatus.PUBLISHED);
                 outboxEventRepository.save(event);
 
-                log.info("Published " + event.getEventType() + " event orderId={}", event.getOrderId());
+                log.info("sagaStep=OUTBOX_PUBLISH eventType={} orderId={}", event.getEventType(), event.getOrderId());
 
             } catch (Exception e) {
 
                 log.error(
-                        "Failed publishing " + event.getEventType() + " event id={}, retry={}",
+                        "sagaStep=OUTBOX_PUBLISH_FAILED eventType={} outboxEventId={} orderId={} retryCount={}",
+                        event.getEventType(),
                         event.getId(),
+                        event.getOrderId(),
                         event.getRetryCount(),
                         e
                 );
@@ -71,10 +78,13 @@ public class OutboxPublisher {
 
                 if (event.getRetryCount() >= 5) {
                     event.setStatus(OutboxStatus.FAILED);
-                    log.error(event.getEventType() + " event marked FAILED id={}", event.getId());
+                    log.error("sagaStep=OUTBOX_PUBLISH_EXHAUSTED eventType={} outboxEventId={} orderId={}",
+                            event.getEventType(), event.getId(), event.getOrderId());
                 }
 
                 outboxEventRepository.save(event);
+            } finally {
+                MDC.clear();
             }
         }
     }

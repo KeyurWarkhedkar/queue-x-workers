@@ -10,6 +10,7 @@ import com.keyur.queue_x_workers.Repositories.OutboxEventRepository;
 import com.keyur.queue_x_workers.Repositories.ProductRepository;
 import lombok.AllArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -33,6 +34,8 @@ public class OrderEventConsumer {
     @Transactional
     public void inventoryWorker() {
         EventDto event = messageQueue.consume(QueueConstants.orderQueue);
+        // No orderId yet at this exact point if event is null — that's fine,
+        // this line is a poll-heartbeat, not a saga step.
         log.info("Polled SQS order_queue, got: {}", event == null ? "null" : event.getOrderId());
         if(event == null) return;
         processEvent(event);
@@ -40,30 +43,44 @@ public class OrderEventConsumer {
 
 
     public void processEvent(EventDto event) {
-        // Step 1: blind INSERT as atomic lock
-        if(!idempotencyService.saveRecord(event.getEventId(), event.getOrderId())) {
-            return;
+        // Fresh MDC per event on this scheduler thread — cleared in finally so it
+        // never leaks into the next unrelated order processed on the same thread.
+        try {
+            MDC.put("orderId", String.valueOf(event.getOrderId()));
+            log.info("sagaStep=ORDER_EVENT_CONSUMED eventId={} orderId={} productId={} quantity={}",
+                    event.getEventId(), event.getOrderId(), event.getProductId(), event.getQuantity());
+
+            // Step 1: blind INSERT as atomic lock
+            if(!idempotencyService.saveRecord(event.getEventId(), event.getOrderId())) {
+                log.info("sagaStep=ORDER_EVENT_SKIPPED reason=ALREADY_PROCESSED eventId={} orderId={}", event.getEventId(), event.getOrderId());
+                return;
+            }
+
+            // Step 2: atomic decrement
+            int affected = productRepository.atomicDecrement(
+                    event.getProductId(), event.getQuantity()
+            );
+
+            if(affected == 0) {
+                // out of stock
+                log.info("sagaStep=INVENTORY_CHECK result=OUT_OF_STOCK orderId={} productId={}", event.getOrderId(), event.getProductId());
+                writeToOutbox(event, 0, EventType.OUT_OF_STOCK);
+                writeToOutbox(event, 0, EventType.OUT_OF_STOCK_NOTIFICATION);
+                return;
+            }
+
+            // Step 3: calculate amount on backend
+            Product product = productRepository.findById(event.getProductId())
+                    .orElseThrow(() -> new RuntimeException("Product not found"));
+            double amount = product.getPrice() * event.getQuantity();
+
+            log.info("sagaStep=INVENTORY_CHECK result=SUCCESS orderId={} productId={} amount={}", event.getOrderId(), event.getProductId(), amount);
+
+            // Step 4: write success outbox
+            writeToOutbox(event, amount, EventType.INVENTORY_SUCCESS);
+        } finally {
+            MDC.clear();
         }
-
-        // Step 2: atomic decrement
-        int affected = productRepository.atomicDecrement(
-                event.getProductId(), event.getQuantity()
-        );
-
-        if(affected == 0) {
-            // out of stock
-            writeToOutbox(event, 0, EventType.OUT_OF_STOCK);
-            writeToOutbox(event, 0, EventType.OUT_OF_STOCK_NOTIFICATION);
-            return;
-        }
-
-        // Step 3: calculate amount on backend
-        Product product = productRepository.findById(event.getProductId())
-                .orElseThrow(() -> new RuntimeException("Product not found"));
-        double amount = product.getPrice() * event.getQuantity();
-
-        // Step 4: write success outbox
-        writeToOutbox(event, amount, EventType.INVENTORY_SUCCESS);
     }
 
     private void writeToOutbox(EventDto event, double amount, EventType eventType) {
@@ -79,5 +96,7 @@ public class OrderEventConsumer {
         outboxEvent.setUserId(event.getUserId());
         outboxEvent.setCreatedAt(LocalDateTime.now());
         outboxEventRepository.save(outboxEvent);
+
+        log.info("sagaStep=OUTBOX_WRITE eventType={} orderId={} outboxStatus=PENDING", eventType, event.getOrderId());
     }
 }

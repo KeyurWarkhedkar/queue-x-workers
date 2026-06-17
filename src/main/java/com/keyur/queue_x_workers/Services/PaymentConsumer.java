@@ -9,6 +9,7 @@ import com.keyur.queue_x_workers.Repositories.OutboxEventRepository;
 import com.keyur.queue_x_workers.Repositories.PaymentRepository;
 import lombok.AllArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -33,42 +34,53 @@ public class PaymentConsumer {
         EventDto eventDto = messageQueue.consume(QueueConstants.paymentQueue);
         if(eventDto == null) return;
 
-        // Step 2: retry loop with exponential backoff
-        boolean success = false;
-        String failureReason = null;
+        // Fresh MDC for this one order's entire payment attempt (including all retries below) —
+        // cleared in finally so it never leaks into the next unrelated order on this thread.
+        try {
+            MDC.put("orderId", String.valueOf(eventDto.getOrderId()));
+            log.info("sagaStep=PAYMENT_CONSUMED eventId={} orderId={} amount={}",
+                    eventDto.getEventId(), eventDto.getOrderId(), eventDto.getAmount());
 
-        for(int i = 0; i < 3; i++) {
-            try {
-                success = paymentService.processPayment(
-                        eventDto.getOrderId(),
-                        eventDto.getAmount(),
-                        eventDto.getEventId()  // gateway idempotency key
-                );
-                break;
-            } catch(Exception e) {
-                failureReason = e.getMessage();
-                log.warn("Payment attempt {} failed for orderId={}, reason={}",
-                        i + 1, eventDto.getOrderId(), e.getMessage());
-                if(i < 2) {
-                    try {
-                        Thread.sleep((long) Math.pow(2, i) * 1000); // 1s then 2s
-                    } catch(InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        break;
+            // Step 2: retry loop with exponential backoff
+            boolean success = false;
+            String failureReason = null;
+
+            for(int i = 0; i < 3; i++) {
+                try {
+                    log.info("sagaStep=PAYMENT_ATTEMPT attemptNumber={} orderId={}", i + 1, eventDto.getOrderId());
+                    success = paymentService.processPayment(
+                            eventDto.getOrderId(),
+                            eventDto.getAmount(),
+                            eventDto.getEventId()  // gateway idempotency key
+                    );
+                    break;
+                } catch(Exception e) {
+                    failureReason = e.getMessage();
+                    log.warn("sagaStep=PAYMENT_ATTEMPT_FAILED attemptNumber={} orderId={} reason={}",
+                            i + 1, eventDto.getOrderId(), e.getMessage());
+                    if(i < 2) {
+                        try {
+                            Thread.sleep((long) Math.pow(2, i) * 1000); // 1s then 2s
+                        } catch(InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
                     }
                 }
             }
-        }
 
-        // Step 3: save result in short transaction
-        savePaymentResult(eventDto, success, failureReason);
+            // Step 3: save result in short transaction
+            savePaymentResult(eventDto, success, failureReason);
+        } finally {
+            MDC.clear();
+        }
     }
 
 
     public void savePaymentResult(EventDto eventDto, boolean success, String failureReason) {
         // Step 1: idempotency check FIRST before any payment call
         if(!idempotencyService.saveRecord(eventDto.getEventId(), eventDto.getOrderId())) {
-            log.info("Already processed eventId={}, skipping", eventDto.getEventId());
+            log.info("sagaStep=PAYMENT_RESULT_SKIPPED reason=ALREADY_PROCESSED eventId={} orderId={}", eventDto.getEventId(), eventDto.getOrderId());
             return;
         }
 
@@ -85,13 +97,12 @@ public class PaymentConsumer {
             // order status update + notification
             writeToOutbox(eventDto, eventDto.getAmount(), EventType.PAYMENT_SUCCESS);
             writeToOutbox(eventDto, eventDto.getAmount(), EventType.PAYMENT_SUCCESS_NOTIFICATION);
-            log.info("Payment successful for orderId={}",
-                    eventDto.getOrderId());
+            log.info("sagaStep=PAYMENT_RESULT result=SUCCESS orderId={}", eventDto.getOrderId());
         } else {
             // order status update + notification
             writeToOutbox(eventDto, 0, EventType.PAYMENT_FAILED);
             writeToOutbox(eventDto, 0, EventType.PAYMENT_FAILED_NOTIFICATION);
-            log.warn("Payment failed for orderId={} after max retries", eventDto.getOrderId());
+            log.warn("sagaStep=PAYMENT_RESULT result=FAILED orderId={} reason={}", eventDto.getOrderId(), failureReason);
         }
     }
 
@@ -108,5 +119,7 @@ public class PaymentConsumer {
         outboxEvent.setRetryCount(0);
         outboxEvent.setCreatedAt(LocalDateTime.now());
         outboxEventRepository.save(outboxEvent);
+
+        log.info("sagaStep=OUTBOX_WRITE eventType={} orderId={} outboxStatus=PENDING", eventType, event.getOrderId());
     }
 }
