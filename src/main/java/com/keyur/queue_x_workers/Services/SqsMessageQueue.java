@@ -50,8 +50,6 @@ public class SqsMessageQueue implements MessageQueue {
                             .build()
             ).messages();
 
-            log.info("SQS poll result size: {}", messages.size());
-
             if (messages.isEmpty()) return null;
 
             Message message = messages.get(0);
