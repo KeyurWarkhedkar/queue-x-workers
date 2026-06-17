@@ -36,7 +36,6 @@ public class OrderEventConsumer {
         EventDto event = messageQueue.consume(QueueConstants.orderQueue);
         // No orderId yet at this exact point if event is null — that's fine,
         // this line is a poll-heartbeat, not a saga step.
-        log.info("Polled SQS order_queue, got: {}", event == null ? "null" : event.getOrderId());
         if(event == null) return;
         processEvent(event);
     }
