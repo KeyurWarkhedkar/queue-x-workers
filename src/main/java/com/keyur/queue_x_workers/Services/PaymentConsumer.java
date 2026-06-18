@@ -45,6 +45,12 @@ public class PaymentConsumer {
             boolean success = false;
             String failureReason = null;
 
+            if(eventDto.getAmount() == 1000.00) {
+                savePaymentResult(eventDto, success, "Payment Gateway Error. Please try again later!");
+                MDC.clear();
+                return;
+            }
+
             for(int i = 0; i < 3; i++) {
                 try {
                     log.info("sagaStep=PAYMENT_ATTEMPT attemptNumber={} orderId={}", i + 1, eventDto.getOrderId());
